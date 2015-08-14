@@ -22,6 +22,7 @@ import socket
 import sys
 import time
 import random
+import asyncio
 
 try:
     import threading as _threading
@@ -738,6 +739,14 @@ class Resolver(object):
 
     def query(self, qname, rdtype=dns.rdatatype.A, rdclass=dns.rdataclass.IN,
               tcp=False, source=None, raise_on_no_answer=True, source_port=0):
+        # XXX shouldn't default keywords in both places, but my python introspection fu is weak.
+        loop = asyncio.get_event_loop()
+        co = self.aquery(qname, rdtype, rdclass, tcp, source, raise_on_no_answer, source_port)
+        return loop.run_until_complete(asyncio.wait_for(co, None))
+
+    @asyncio.coroutine
+    def aquery(self, qname, rdtype=dns.rdatatype.A, rdclass=dns.rdataclass.IN,
+              tcp=False, source=None, raise_on_no_answer=True, source_port=0):
         """Query nameservers to find the answer to the question.
 
         The I{qname}, I{rdtype}, and I{rdclass} parameters may be objects
@@ -793,6 +802,7 @@ class Resolver(object):
                 qnames_to_try.append(qname.concatenate(self.domain))
         all_nxdomain = True
         start = time.time()
+        loop = asyncio.get_event_loop()
         for qname in qnames_to_try:
             if self.cache:
                 answer = self.cache.get((qname, rdtype, rdclass))
@@ -823,22 +833,25 @@ class Resolver(object):
                     timeout = self._compute_timeout(start)
                     try:
                         if tcp:
-                            response = dns.query.tcp(request, nameserver,
-                                                     timeout, self.port,
-                                                     source=source,
-                                                     source_port=source_port)
+                            co = dns.query.tcp(request, nameserver,
+                                               timeout, self.port,
+                                               source=source,
+                                               source_port=source_port)
+                            response = yield from co
                         else:
-                            response = dns.query.udp(request, nameserver,
-                                                     timeout, self.port,
-                                                     source=source,
-                                                     source_port=source_port)
+                            co = dns.query.udp(request, nameserver,
+                                               timeout, self.port,
+                                               source=source,
+                                               source_port=source_port)
+                            response = yield from co
                             if response.flags & dns.flags.TC:
                                 # Response truncated; retry with TCP.
                                 timeout = self._compute_timeout(start)
-                                response = dns.query.tcp(request, nameserver,
-                                                       timeout, self.port,
-                                                       source=source,
-                                                       source_port=source_port)
+                                co = dns.query.tcp(request, nameserver,
+                                                   timeout, self.port,
+                                                   source=source,
+                                                   source_port=source_port)
+                                response = yield from co
 
                     except (socket.error, dns.exception.Timeout):
                         #

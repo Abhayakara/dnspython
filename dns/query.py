@@ -13,12 +13,12 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-"""Talk to a DNS server."""
+"""Talk to a DNS server using asyncio."""
 
 from __future__ import generators
 
 import errno
-import select
+import asyncio
 import socket
 import struct
 import sys
@@ -44,103 +44,6 @@ def _compute_expiration(timeout):
         return None
     else:
         return time.time() + timeout
-
-def _poll_for(fd, readable, writable, error, timeout):
-    """Poll polling backend.
-    @param fd: File descriptor
-    @type fd: int
-    @param readable: Whether to wait for readability
-    @type readable: bool
-    @param writable: Whether to wait for writability
-    @type writable: bool
-    @param timeout: Deadline timeout (expiration time, in seconds)
-    @type timeout: float
-    @return True on success, False on timeout
-    """
-    event_mask = 0
-    if readable:
-        event_mask |= select.POLLIN
-    if writable:
-        event_mask |= select.POLLOUT
-    if error:
-        event_mask |= select.POLLERR
-
-    pollable = select.poll()
-    pollable.register(fd, event_mask)
-
-    if timeout:
-        event_list = pollable.poll(int(timeout * 1000))
-    else:
-        event_list = pollable.poll()
-
-    return bool(event_list)
-
-def _select_for(fd, readable, writable, error, timeout):
-    """Select polling backend.
-    @param fd: File descriptor
-    @type fd: int
-    @param readable: Whether to wait for readability
-    @type readable: bool
-    @param writable: Whether to wait for writability
-    @type writable: bool
-    @param timeout: Deadline timeout (expiration time, in seconds)
-    @type timeout: float
-    @return True on success, False on timeout
-    """
-    rset, wset, xset = [], [], []
-
-    if readable:
-        rset = [fd]
-    if writable:
-        wset = [fd]
-    if error:
-        xset = [fd]
-
-    if timeout is None:
-        (rcount, wcount, xcount) = select.select(rset, wset, xset)
-    else:
-        (rcount, wcount, xcount) = select.select(rset, wset, xset, timeout)
-
-    return bool((rcount or wcount or xcount))
-
-def _wait_for(fd, readable, writable, error, expiration):
-    done = False
-    while not done:
-        if expiration is None:
-            timeout = None
-        else:
-            timeout = expiration - time.time()
-            if timeout <= 0.0:
-                raise dns.exception.Timeout
-        try:
-            if not _polling_backend(fd, readable, writable, error, timeout):
-                raise dns.exception.Timeout
-        except select.error as e:
-            if e.errno != errno.EINTR:
-                raise e
-        done = True
-
-def _set_polling_backend(fn):
-    """
-    Internal API. Do not use.
-    """
-    global _polling_backend
-
-    _polling_backend = fn
-
-if hasattr(select, 'poll'):
-    # Prefer poll() on platforms that support it because it has no
-    # limits on the maximum value of a file descriptor (plus it will
-    # be more efficient for high values).
-    _polling_backend = _poll_for
-else:
-    _polling_backend = _select_for
-
-def _wait_for_readable(s, expiration):
-    _wait_for(s, True, False, True, expiration)
-
-def _wait_for_writable(s, expiration):
-    _wait_for(s, False, True, True, expiration)
 
 def _addresses_equal(af, a1, a2):
     # Convert the first value of the tuple, which is a textual format
@@ -172,6 +75,83 @@ def _destination_and_source(af, where, port, source, source_port):
             source = (source, source_port, 0, 0)
     return (af, destination, source)
 
+# figure out how much time is left, returning that time in seconds;
+# throwing an exception of the expiration time has already passed.
+# return None if Expiration is None.
+def time_remaining(expiration):
+    if expiration != None:
+        fto = expiration - time.time()
+        if fto <= 0:
+            raise dns.exception.Timeout
+        return fto
+    return None
+
+# Send a datagram on a socket, running any other pending coroutines while
+# we wait.   Hides the coroutine dispatch loop, since dnspython only ever
+# one I/O operation at a time.
+#
+# Modeled after sock_recv()/_sock_recv() in selector_events.py in the
+# asyncio module.
+#
+# Note to self: the way this is working, assuming I grok it accurately, is
+# that we are creating a future, which wraps a callback so it can be run
+# on an event loop.   We then call the callback, passing it the future and
+# the arguments.   The callback attempts to send the datagram synchronously;
+# if it succeed, it sets a result on the future, which means that when the
+# caller waits on the future, the wait will return immediately.   If that
+# fails, then the callback registers itself to be called when the descriptor
+# is ready to write.   At that point the callback is called, sets the result
+# on the future, and that allows the call to asyncio.wait_for() to complete.
+
+@asyncio.coroutine
+def asendto(sock, data, dest, expiration):
+    loop = asyncio.get_event_loop()
+    fut = asyncio.futures.Future(loop=loop)
+    timeout = time_remaining(expiration)
+    asendto_callback(fut, loop, False, sock, data, dest)
+    return asyncio.wait_for(fut, timeout)
+
+def asendto_callback(fut, loop, registered, sock, data, dest):
+    fd = sock.fileno()
+    if registered:
+        loop.remove_writer(fd)
+    if fut.cancelled():
+        return
+    try:
+        count = sock.sendto(data, dest)
+    except (BlockingIOError, InterruptedError):
+        loop.add_writer(fd, asendto_callback, fut, loop, True,
+                        sock, data, dest)
+    except Exception as e:
+        fut.set_exception(e)
+    else:
+        fut.set_result(count)
+    
+@asyncio.coroutine
+def arecvfrom(sock, limit, expiration):
+    loop = asyncio.get_event_loop()
+    fut = asyncio.futures.Future(loop=loop)
+    timeout = time_remaining(expiration)
+    arecvfrom_callback(fut, loop, False, sock, limit)
+    return asyncio.wait_for(fut, timeout)
+
+def arecvfrom_callback(fut, loop, registered, sock, limit):
+    fd = sock.fileno()
+    if registered:
+        loop.remove_reader(fd)
+    if fut.cancelled():
+        return
+    try:
+        data, sender = sock.recvfrom(limit)
+    except (BlockingIOError, InterruptedError):
+        loop.add_reader(fd, arecvfrom_callback, fut, loop, True,
+                        sock, limit)
+    except Exception as e:
+        fut.set_exception(e)
+    else:
+        fut.set_result((data, sender))
+
+@asyncio.coroutine
 def udp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         ignore_unexpected=False, one_rr_per_rrset=False):
     """Return the response obtained after sending a query via UDP.
@@ -207,15 +187,16 @@ def udp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
                                                         source_port)
     s = socket.socket(af, socket.SOCK_DGRAM, 0)
     try:
+        s.setblocking(False)
         expiration = _compute_expiration(timeout)
-        s.setblocking(0)
         if source is not None:
             s.bind(source)
-        _wait_for_writable(s, expiration)
-        s.sendto(wire, destination)
+
+        yield from asendto(s, wire, destination, expiration)
+        
         while 1:
-            _wait_for_readable(s, expiration)
-            (wire, from_address) = s.recvfrom(65535)
+            (wire, from_address) = yield from arecvfrom(s, 65535, expiration)
+
             if _addresses_equal(af, from_address, destination) or \
                     (dns.inet.is_multicast(where) and \
                          from_address[1:] == destination[1:]):
@@ -224,6 +205,10 @@ def udp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
                 raise UnexpectedSource('got a response from '
                                        '%s instead of %s' % (from_address,
                                                              destination))
+    except asyncio.TimeoutError:
+        raise dns.exception.Timeout
+    except:
+        raise
     finally:
         s.close()
     r = dns.message.from_wire(wire, keyring=q.keyring, request_mac=q.mac,
@@ -232,6 +217,7 @@ def udp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         raise BadResponse
     return r
 
+@asyncio.coroutine
 def _net_read(sock, count, expiration):
     """Read the specified number of bytes from sock.  Keep trying until we
     either get the desired amount, or we hit EOF.
@@ -239,36 +225,40 @@ def _net_read(sock, count, expiration):
     by the expiration time.
     """
     s = b''
+    loop = asyncio.get_event_loop()
     while count > 0:
-        _wait_for_readable(sock, expiration)
-        n = sock.recv(count)
+        timeout = time_remaining(expiration)
+        co = loop.sock_recv(s, count)
+        n = yield from asyncio.wait_for(co, timeout)
         if n == b'':
             raise EOFError
         count = count - len(n)
         s = s + n
     return s
 
-def _net_write(sock, data, expiration):
+@asyncio.coroutine
+def _net_write(s, data, expiration):
     """Write the specified data to the socket.
     A Timeout exception will be raised if the operation is not completed
     by the expiration time.
     """
-    current = 0
-    l = len(data)
-    while current < l:
-        _wait_for_writable(sock, expiration)
-        current += sock.send(data[current:])
+    loop = asyncio.get_event_loop()
+    timeout = time_remaining(expiration)
+    co = loop.sock_sendall(s, data)
+    return asyncio.wait_for(co, timeout)
 
-def _connect(s, address):
-    try:
-        s.connect(address)
-    except socket.error:
-        (ty, v) = sys.exc_info()[:2]
-        if v.errno != errno.EINPROGRESS and \
-               v.errno != errno.EWOULDBLOCK and \
-               v.errno != errno.EALREADY:
-            raise v
+@asyncio.coroutine
+def _connect(s, address, expiration):
+    """Connect to the specified socket.
+    A Timeout exception will be raised if the operation is not completed
+    by the expiration time.
+    """
+    loop = asyncio.get_event_loop()
+    timeout = time_remaining(expiration)
+    co = loop.sock_connect(s, address)
+    return asyncio.wait_for(co, timeout)
 
+@asyncio.coroutine
 def tcp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         one_rr_per_rrset=False):
     """Return the response obtained after sending a query via TCP.
@@ -305,7 +295,7 @@ def tcp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         s.setblocking(0)
         if source is not None:
             s.bind(source)
-        _connect(s, destination)
+        yield from _connect(s, destination, expiration)
 
         l = len(wire)
 
@@ -313,10 +303,14 @@ def tcp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         # avoid writev() or doing a short write that would get pushed
         # onto the net
         tcpmsg = struct.pack("!H", l) + wire
-        _net_write(s, tcpmsg, expiration)
-        ldata = _net_read(s, 2, expiration)
+        yield from _net_write(s, tcpmsg, expiration)
+        ldata = yield from _net_read(s, 2, expiration)
         (l,) = struct.unpack("!H", ldata)
-        wire = _net_read(s, l, expiration)
+        wire = yield from _net_read(s, l, expiration)
+    except asyncio.TimeoutError:
+        raise dns.exception.Timeout
+    except:
+        raise
     finally:
         s.close()
     r = dns.message.from_wire(wire, keyring=q.keyring, request_mac=q.mac,
@@ -325,6 +319,7 @@ def tcp(q, where, timeout=None, port=53, af=None, source=None, source_port=0,
         raise BadResponse
     return r
 
+@asyncio.coroutine
 def xfr(where, zone, rdtype=dns.rdatatype.AXFR, rdclass=dns.rdataclass.IN,
         timeout=None, port=53, keyring=None, keyname=None, relativize=True,
         af=None, lifetime=None, source=None, source_port=0, serial=0,
@@ -402,14 +397,18 @@ def xfr(where, zone, rdtype=dns.rdatatype.AXFR, rdclass=dns.rdataclass.IN,
     if source is not None:
         s.bind(source)
     expiration = _compute_expiration(lifetime)
-    _connect(s, destination)
+    try:
+        yield from _connect(s, destination, expiration)
+    except asyncio.TimeoutError:
+        raise dns.exception.Timeout
+    except:
+        raise
     l = len(wire)
     if use_udp:
-        _wait_for_writable(s, expiration)
-        s.send(wire)
+        yield from _net_write(s, wire, expiration)
     else:
         tcpmsg = struct.pack("!H", l) + wire
-        _net_write(s, tcpmsg, expiration)
+        yield from _net_write(s, tcpmsg, expiration)
     done = False
     delete_mode = True
     expecting_SOA = False
@@ -427,13 +426,17 @@ def xfr(where, zone, rdtype=dns.rdatatype.AXFR, rdclass=dns.rdataclass.IN,
         mexpiration = _compute_expiration(timeout)
         if mexpiration is None or mexpiration > expiration:
             mexpiration = expiration
-        if use_udp:
-            _wait_for_readable(s, expiration)
-            (wire, from_address) = s.recvfrom(65535)
-        else:
-            ldata = _net_read(s, 2, mexpiration)
-            (l,) = struct.unpack("!H", ldata)
-            wire = _net_read(s, l, mexpiration)
+        try:
+            if use_udp:
+                (wire, from_address) = yield from arecvfrom(s, 65535, expiration)
+            else:
+                ldata = yield from _net_read(s, 2, mexpiration)
+                (l,) = struct.unpack("!H", ldata)
+                wire = yield from _net_read(s, l, mexpiration)
+        except asyncio.TimeoutError:
+            raise dns.exception.Timeout
+        except:
+            raise
         r = dns.message.from_wire(wire, keyring=q.keyring, request_mac=q.mac,
                                   xfr=True, origin=origin, tsig_ctx=tsig_ctx,
                                   multi=True, first=first,
@@ -492,3 +495,18 @@ def xfr(where, zone, rdtype=dns.rdatatype.AXFR, rdclass=dns.rdataclass.IN,
             raise dns.exception.FormError("missing TSIG")
         yield r
     s.close()
+
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, 0)
+    s.setblocking(False)
+    # Send a query to the local resolver.
+    n = dns.name.from_text("www.dnspython.org")
+    request = dns.message.make_query(n, dns.rdatatype.A, dns.rdataclass.IN)
+    expiration = _compute_expiration(10)
+    co = asendto(s, request.to_wire(), ("127.0.0.1", 53), expiration)
+    loop.run_until_complete(co)
+    co = arecvfrom(s, 65535, expiration)
+    (wire, from_address) = loop.run_until_complete(co)
+    result = dns.message.from_wire(wire)
+    print(repr(result))

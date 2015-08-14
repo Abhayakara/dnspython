@@ -102,26 +102,5 @@ class BaseResolverTests(object):
             zname = dns.resolver.zone_for_name(name)
         self.assertRaises(dns.resolver.NotAbsolute, bad)
 
-class PollingMonkeyPatchMixin(object):
-    def setUp(self):
-        self.__native_polling_backend = dns.query._polling_backend
-        dns.query._set_polling_backend(self.polling_backend())
-
-        unittest.TestCase.setUp(self)
-
-    def tearDown(self):
-        dns.query._set_polling_backend(self.__native_polling_backend)
-
-        unittest.TestCase.tearDown(self)
-
-class SelectResolverTestCase(PollingMonkeyPatchMixin, BaseResolverTests, unittest.TestCase):
-    def polling_backend(self):
-        return dns.query._select_for
-
-if hasattr(select, 'poll'):
-    class PollResolverTestCase(PollingMonkeyPatchMixin, BaseResolverTests, unittest.TestCase):
-        def polling_backend(self):
-            return dns.query._poll_for
-
 if __name__ == '__main__':
     unittest.main()
